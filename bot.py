@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import random
+import re
+import sys
 import time
 from collections import defaultdict
 
@@ -11,7 +13,29 @@ from vkbottle import API, Bot, Keyboard, KeyboardButtonColor, Text
 from vkbottle.bot import Message
 
 # ================== ТИШИНА В КОНСОЛИ ==================
-logging.getLogger("vkbottle").setLevel(logging.WARNING)
+# Стандартный logging: гасим все дочерние логгеры vkbottle
+for _name in list(logging.Logger.manager.loggerDict):
+    if _name == "vkbottle" or _name.startswith("vkbottle."):
+        _lg = logging.getLogger(_name)
+        _lg.setLevel(logging.WARNING)
+        _lg.propagate = False
+
+# loguru: vkbottle может писать через него — отключаем полностью
+try:
+    from loguru import logger as _loguru_logger
+    _loguru_logger.remove()
+except ImportError:
+    pass
+
+# Наши собственные сообщения — через logging, чтобы точно были видны в Bothost
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stderr,
+    force=True,
+)
+log = logging.getLogger("bot")
+
 
 # ================== ЗАГРУЗКА НАСТРОЕК ==================
 load_dotenv()
@@ -48,6 +72,19 @@ if not ANIME_GROUP_IDS:
 if not PHOTO_GROUP_IDS:
     raise SystemExit("[ОШИБКА] VK_PHOTO_GROUP_IDS пуст — заполните его")
 
+# ================== НОРМАЛИЗАЦИЯ ТЕКСТА ==================
+# Упоминания в беседах приходят как [club241483237|biblo] или [id123456|Имя]
+_MENTION_RE = re.compile(r"\[(?:club|id|public)\d+\|[^\]]+\]")
+
+
+def normalize_text(text: str | None) -> str:
+    """Убирает упоминания VK и схлопывает пробелы."""
+    if not text:
+        return ""
+    cleaned = _MENTION_RE.sub("", text)
+    return " ".join(cleaned.split())
+
+
 # ================== КЛЮЧЕВЫЕ СЛОВА ДЛЯ «РАНДОМА» ==================
 RANDOM_SEARCH_KEYWORDS = [
     "новости", "юмор", "наука", "кино", "спорт", "технологии",
@@ -56,11 +93,8 @@ RANDOM_SEARCH_KEYWORDS = [
     "история", "психология", "дизайн", "аниме", "мемы",
 ]
 
-# Сколько сообществ брать из результатов поиска для одной попытки
 RANDOM_GROUPS_PER_ATTEMPT = 5
-# Сколько постов смотреть в каждом сообществе
 RANDOM_POSTS_PER_GROUP = 10
-# Сколько попыток делать, прежде чем вернуть «Пусто»
 RANDOM_MAX_ATTEMPTS = 5
 
 # ================== КАТЕГОРИИ ==================
@@ -83,14 +117,20 @@ CATEGORIES = {
     "random": {
         "label": "Рандом",
         "triggers": ["Рандом", "рандом", "/random", "РАНДОМ"],
-        "group_ids": [],                   # не используется
-        "mode": "random_communities",      # особый режим
+        "group_ids": [],
+        "mode": "random_communities",
     },
 }
 
 ALL_TRIGGERS: list[str] = []
 for _cat in CATEGORIES.values():
     ALL_TRIGGERS.extend(_cat["triggers"])
+
+RESET_TRIGGERS = ["Сброс", "сброс", "/reset", "/сброс", "СБРОС"]
+HELP_TRIGGERS = [
+    "Помощь", "помощь", "/help", "/помощь", "Help", "help",
+    "Начать", "начать", "/start", "Старт", "старт", "Меню", "меню",
+]
 
 
 def detect_category(text: str | None) -> str | None:
@@ -103,7 +143,7 @@ def detect_category(text: str | None) -> str | None:
 
 
 # ================== СОСТОЯНИЕ ==================
-STATE_FILE = os.path.join("data", "state.json")   # постоянная папка на Bothost
+STATE_FILE = os.path.join("data", "state.json")
 state_lock = asyncio.Lock()
 peer_locks = defaultdict(asyncio.Lock)
 last_request: dict[tuple[str, int], float] = {}
@@ -119,7 +159,7 @@ def load_state() -> dict:
             data.setdefault("known", {})
             return data
         except Exception as e:
-            print(f"[!] Не удалось прочитать {STATE_FILE}: {e}. Начинаю с чистого листа.")
+            log.warning(f"Не удалось прочитать {STATE_FILE}: {e}. Начинаю с чистого листа.")
     return {"seen": {}, "known": {}}
 
 
@@ -129,12 +169,12 @@ def save_state() -> None:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[!] Не удалось сохранить {STATE_FILE}: {e}")
+        log.error(f"Не удалось сохранить {STATE_FILE}: {e}")
 
 
 state = load_state()
 
-# ================== КЛАВИАТУРА И ТЕКСТ ПОМОЩИ ==================
+# ================== КЛАВИАТУРА ==================
 
 def make_keyboard() -> Keyboard:
     return (
@@ -161,11 +201,9 @@ HELP_TEXT = (
     "    • Сначала показываю новые посты (которых раньше не было).\n"
     "    • Если новых нет — следующий по популярности из старых.\n"
     "    • Если все доступные посты уже показаны — пишу «Пусто».\n\n"
-    "♻️ «Сброс» — очищаю память по всем разделам. После этого посты "
-    "снова пойдут по кругу.\n\n"
+    "♻️ «Сброс» — очищаю память по всем разделам.\n\n"
     "⏱ Внутри одного раздела между запросами есть пауза — защита от спама. "
-    "Разные разделы друг другу не мешают: можно запросить «Новости», затем "
-    "сразу «Аниме», затем «Фото», затем «Рандом»."
+    "Разные разделы друг другу не мешают."
 )
 
 # ================== ЛОГИКА ==================
@@ -174,11 +212,10 @@ bot = Bot(token=BOT_TOKEN)
 
 
 async def get_candidate_for_group(group_id: int, peer_key: str):
-    """Возвращает (post, status) для фиксированного списка групп."""
     try:
         response = await api.wall.get(owner_id=group_id, count=POSTS_PER_GROUP)
     except Exception as e:
-        print(f"[ОШИБКА] Чтение группы {group_id}: {e}")
+        log.error(f"Чтение группы {group_id}: {e}")
         return None, "error"
 
     posts = response.items
@@ -217,18 +254,11 @@ async def get_candidate_for_group(group_id: int, peer_key: str):
 
 
 async def get_random_post_from_random_community(peer_key: str):
-    """
-    Ищет посты в случайных сообществах VK.
-    Возвращает (post, status), где status:
-      "ok"     — нашли пост для отправки
-      "empty"  — после всех попыток ничего нового не нашли
-      "error"  — что-то сломалось на уровне API
-    """
     last_error = False
 
     for attempt in range(1, RANDOM_MAX_ATTEMPTS + 1):
         keyword = random.choice(RANDOM_SEARCH_KEYWORDS)
-        print(f"[🎲] Рандом, попытка {attempt}/{RANDOM_MAX_ATTEMPTS}: слово «{keyword}»")
+        log.info(f"🎲 Рандом, попытка {attempt}/{RANDOM_MAX_ATTEMPTS}: слово «{keyword}»")
 
         try:
             search_response = await api.groups.search(
@@ -237,13 +267,12 @@ async def get_random_post_from_random_community(peer_key: str):
                 count=100,
             )
         except Exception as e:
-            print(f"[ОШИБКА] groups.search «{keyword}»: {e}")
+            log.error(f"groups.search «{keyword}»: {e}")
             last_error = True
             continue
 
         groups = search_response.items or []
         if not groups:
-            print(f"[!] По слову «{keyword}» ничего не найдено")
             continue
 
         sample_size = min(RANDOM_GROUPS_PER_ATTEMPT, len(groups))
@@ -259,7 +288,7 @@ async def get_random_post_from_random_community(peer_key: str):
                 )
                 all_posts.extend(wall_response.items)
             except Exception as e:
-                print(f"[ОШИБКА] Чтение стены группы {group_id}: {e}")
+                log.warning(f"Чтение стены группы {group_id}: {e}")
                 continue
 
         if not all_posts:
@@ -279,7 +308,7 @@ async def get_random_post_from_random_community(peer_key: str):
                 async with state_lock:
                     state["seen"].setdefault(peer_key, []).append(key)
                     save_state()
-                print(f"[🎲] Найден новый пост: {post.owner_id}_{post.id}")
+                log.info(f"🎲 Найден новый пост: {post.owner_id}_{post.id}")
                 return post, "ok"
 
     if last_error:
@@ -300,7 +329,7 @@ async def process_category(message: Message, category_name: str):
 
         if elapsed < COOLDOWN_SECONDS:
             remaining = COOLDOWN_SECONDS - elapsed
-            print(f"[!] {peer_id} / {category_name}: кулдаун, осталось {remaining:.1f} сек.")
+            log.info(f"{peer_id} / {category_name}: кулдаун, осталось {remaining:.1f} сек.")
             await message.answer(
                 f"⏳ По разделу «{cat['label']}» подожди {remaining:.0f} сек.",
                 keyboard=make_keyboard(),
@@ -308,26 +337,21 @@ async def process_category(message: Message, category_name: str):
             return
 
         last_request[lock_key] = now
-
-        print(f"[→] {message.from_id}: «{cat['label']}» в чат {peer_id}")
+        log.info(f"→ {message.from_id}: «{cat['label']}» в чат {peer_id}")
         await message.answer(f"Ищу «{cat['label']}»...", keyboard=make_keyboard())
 
-        # --- РЕЖИМ «РАНДОМ» ---
         if cat.get("mode") == "random_communities":
             post, status = await get_random_post_from_random_community(peer_key)
-
             if post:
                 attachment = f"wall{post.owner_id}_{post.id}"
                 try:
                     await message.answer(attachment=attachment)
                     likes = post.likes.count if post.likes else 0
-                    print(f"[←] {peer_id} / random: {attachment} (лайков {likes})")
+                    log.info(f"← {peer_id} / random: {attachment} (лайков {likes})")
                 except Exception as e:
-                    print(f"[ОШИБКА] Отправка {attachment}: {e}")
-                    await message.answer(
-                        "Не удалось отправить найденный пост.",
-                        keyboard=make_keyboard(),
-                    )
+                    log.error(f"Отправка {attachment}: {e}")
+                    await message.answer("Не удалось отправить найденный пост.",
+                                         keyboard=make_keyboard())
             else:
                 if status == "empty":
                     await message.answer(
@@ -340,10 +364,8 @@ async def process_category(message: Message, category_name: str):
                         "🎲 «Рандом»: не удалось найти посты. Попробуй позже.",
                         keyboard=make_keyboard(),
                     )
-            print(f"[←] {peer_id} / random: обработка завершена")
             return
 
-        # --- РЕЖИМ «ФИКСИРОВАННЫЕ ГРУППЫ» (news / anime / photo) ---
         for group_id in cat["group_ids"]:
             post, status = await get_candidate_for_group(group_id, peer_key)
 
@@ -352,13 +374,11 @@ async def process_category(message: Message, category_name: str):
                 try:
                     await message.answer(attachment=attachment)
                     likes = post.likes.count if post.likes else 0
-                    print(f"[←] {peer_id} / {category_name}: {attachment} (лайков {likes})")
+                    log.info(f"← {peer_id} / {category_name}: {attachment} (лайков {likes})")
                 except Exception as e:
-                    print(f"[ОШИБКА] Отправка {attachment}: {e}")
-                    await message.answer(
-                        f"Не удалось отправить пост из группы {group_id}",
-                        keyboard=make_keyboard(),
-                    )
+                    log.error(f"Отправка {attachment}: {e}")
+                    await message.answer(f"Не удалось отправить пост из группы {group_id}",
+                                         keyboard=make_keyboard())
             else:
                 if status == "empty":
                     await message.answer(
@@ -377,20 +397,18 @@ async def process_category(message: Message, category_name: str):
                         keyboard=make_keyboard(),
                     )
 
-        print(f"[←] {peer_id} / {category_name}: обработка завершена")
-
 
 # ================== ОБРАБОТЧИКИ ==================
 
-@bot.on.message(text=ALL_TRIGGERS)
+@bot.on.message(func=lambda m: normalize_text(m.text) in ALL_TRIGGERS)
 async def category_handler(message: Message):
-    category_name = detect_category(message.text)
-    if not category_name:
-        return
-    await process_category(message, category_name)
+    text = normalize_text(message.text)
+    category_name = detect_category(text)
+    if category_name:
+        await process_category(message, category_name)
 
 
-@bot.on.message(text=["Сброс", "сброс", "/reset", "/сброс", "СБРОС"])
+@bot.on.message(func=lambda m: normalize_text(m.text) in RESET_TRIGGERS)
 async def reset_handler(message: Message):
     peer_id = message.peer_id
 
@@ -403,10 +421,8 @@ async def reset_handler(message: Message):
             total_groups += len(state["known"].pop(peer_key, {}))
         save_state()
 
-    print(
-        f"[↺] {peer_id}: сброс памяти по всем разделам "
-        f"(удалено seen={total_seen}, known_groups={total_groups})"
-    )
+    log.info(f"↺ {peer_id}: сброс памяти по всем разделам "
+             f"(удалено seen={total_seen}, known_groups={total_groups})")
     await message.answer(
         "♻️ Память по всем разделам («Новости», «Аниме», «Фото», «Рандом») сброшена. "
         "Посты снова будут показываться по кругу.",
@@ -414,19 +430,16 @@ async def reset_handler(message: Message):
     )
 
 
-@bot.on.message(text=[
-    "Помощь", "помощь", "/help", "/помощь", "Help", "help",
-    "Начать", "начать", "/start", "Старт", "старт", "Меню", "меню",
-])
+@bot.on.message(func=lambda m: normalize_text(m.text) in HELP_TRIGGERS)
 async def help_handler(message: Message):
-    print(f"[?] {message.from_id} запросил помощь в чате {message.peer_id}")
+    log.info(f"? {message.from_id} запросил помощь в чате {message.peer_id}")
     await message.answer(HELP_TEXT, keyboard=make_keyboard())
 
 
-# ВАЖНО: должен идти последним
+# ВАЖНО: последний
 @bot.on.message()
 async def fallback_handler(message: Message):
-    print(f"[?] {message.from_id}: неизвестная команда «{message.text}»")
+    log.info(f"? {message.from_id}: неизвестная команда «{message.text}»")
     await message.answer(
         "Не знаю такую команду. Вот что я умею:\n\n" + HELP_TEXT,
         keyboard=make_keyboard(),
@@ -434,12 +447,12 @@ async def fallback_handler(message: Message):
 
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("Бот запускается... (Ctrl+C для остановки)")
-    print(f"Новости: {NEWS_GROUP_IDS}")
-    print(f"Аниме:   {ANIME_GROUP_IDS}")
-    print(f"Фото:    {PHOTO_GROUP_IDS}")
-    print(f"Рандом:  поиск по {len(RANDOM_SEARCH_KEYWORDS)} ключевым словам")
-    print(f"Кулдаун внутри одного раздела: {COOLDOWN_SECONDS:.0f} сек.")
-    print("=" * 50)
+    log.info("=" * 50)
+    log.info("Бот запускается...")
+    log.info(f"Новости: {NEWS_GROUP_IDS}")
+    log.info(f"Аниме:   {ANIME_GROUP_IDS}")
+    log.info(f"Фото:    {PHOTO_GROUP_IDS}")
+    log.info(f"Рандом:  поиск по {len(RANDOM_SEARCH_KEYWORDS)} ключевым словам")
+    log.info(f"Кулдаун: {COOLDOWN_SECONDS:.0f} сек.")
+    log.info("=" * 50)
     bot.run_forever()
