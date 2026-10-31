@@ -17,28 +17,74 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("VK_BOT_TOKEN")
 SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN")
-GROUP_IDS_RAW = os.getenv("VK_GROUP_IDS", "")
+NEWS_GROUP_IDS_RAW = os.getenv("VK_GROUP_IDS", "")
+ANIME_GROUP_IDS_RAW = os.getenv("VK_ANIME_GROUP_IDS", "")
+PHOTO_GROUP_IDS_RAW = os.getenv("VK_PHOTO_GROUP_IDS", "")
 COOLDOWN_SECONDS = float(os.getenv("VK_COOLDOWN_SECONDS", "15"))
+POSTS_PER_GROUP = int(os.getenv("VK_POSTS_PER_GROUP", "10"))
 
 if not BOT_TOKEN:
-    raise SystemExit("[ОШИБКА] VK_BOT_TOKEN не задан в .env")
+    raise SystemExit("[ОШИБКА] VK_BOT_TOKEN не задан")
 if not SERVICE_TOKEN:
-    raise SystemExit("[ОШИБКА] VK_SERVICE_TOKEN не задан в .env")
+    raise SystemExit("[ОШИБКА] VK_SERVICE_TOKEN не задан")
 
-try:
-    GROUP_IDS = [int(x.strip()) for x in GROUP_IDS_RAW.split(",") if x.strip()]
-except ValueError:
-    raise SystemExit("[ОШИБКА] VK_GROUP_IDS должен быть списком чисел через запятую")
-if not GROUP_IDS:
-    raise SystemExit("[ОШИБКА] VK_GROUP_IDS пуст")
 
-POSTS_PER_GROUP = int(os.getenv("VK_POSTS_PER_GROUP", "10"))
+def parse_ids(raw: str, var_name: str) -> list[int]:
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise SystemExit(f"[ОШИБКА] {var_name} должен быть списком чисел через запятую")
+
+
+NEWS_GROUP_IDS = parse_ids(NEWS_GROUP_IDS_RAW, "VK_GROUP_IDS")
+ANIME_GROUP_IDS = parse_ids(ANIME_GROUP_IDS_RAW, "VK_ANIME_GROUP_IDS")
+PHOTO_GROUP_IDS = parse_ids(PHOTO_GROUP_IDS_RAW, "VK_PHOTO_GROUP_IDS")
+
+if not NEWS_GROUP_IDS:
+    raise SystemExit("[ОШИБКА] VK_GROUP_IDS пуст — заполните его")
+if not ANIME_GROUP_IDS:
+    raise SystemExit("[ОШИБКА] VK_ANIME_GROUP_IDS пуст — заполните его")
+if not PHOTO_GROUP_IDS:
+    raise SystemExit("[ОШИБКА] VK_PHOTO_GROUP_IDS пуст — заполните его")
+
+# ================== КАТЕГОРИИ ==================
+CATEGORIES = {
+    "news": {
+        "label": "Новости",
+        "triggers": ["Новости", "новости", "/новости", "НОВОСТИ"],
+        "group_ids": NEWS_GROUP_IDS,
+    },
+    "anime": {
+        "label": "Аниме",
+        "triggers": ["Аниме", "аниме", "/anime", "АНИМЕ"],
+        "group_ids": ANIME_GROUP_IDS,
+    },
+    "photo": {
+        "label": "Фото",
+        "triggers": ["Фото", "фото", "/photo", "ФОТО"],
+        "group_ids": PHOTO_GROUP_IDS,
+    },
+}
+
+ALL_TRIGGERS: list[str] = []
+for _cat in CATEGORIES.values():
+    ALL_TRIGGERS.extend(_cat["triggers"])
+
+
+def detect_category(text: str | None) -> str | None:
+    if not text:
+        return None
+    for name, cat in CATEGORIES.items():
+        if text in cat["triggers"]:
+            return name
+    return None
+
 
 # ================== СОСТОЯНИЕ ==================
 STATE_FILE = "state.json"
 state_lock = asyncio.Lock()
 peer_locks = defaultdict(asyncio.Lock)
-last_request: dict[int, float] = {}
+last_request: dict[tuple[str, int], float] = {}
 
 
 def load_state() -> dict:
@@ -67,25 +113,38 @@ state = load_state()
 # ================== КЛАВИАТУРА И ТЕКСТ ПОМОЩИ ==================
 
 def make_keyboard() -> Keyboard:
-    """Клавиатура с кнопками. Показывается под полем ввода."""
+    """
+    Клавиатура с кнопками.
+    one_time=True — после нажатия кнопки клавиатура сворачивается,
+    открыть её заново можно вручную по иконке рядом с полем ввода.
+    """
     return (
-        Keyboard(one_time=False, inline=False)
+        Keyboard(one_time=True, inline=False)
         .add(Text("Новости"), color=KeyboardButtonColor.PRIMARY)
-        .add(Text("Сброс"), color=KeyboardButtonColor.SECONDARY)
+        .add(Text("Аниме"), color=KeyboardButtonColor.PRIMARY)
+        .add(Text("Фото"), color=KeyboardButtonColor.PRIMARY)
         .row()
+        .add(Text("Сброс"), color=KeyboardButtonColor.SECONDARY)
         .add(Text("Помощь"), color=KeyboardButtonColor.SECONDARY)
     )
 
 
 HELP_TEXT = (
     "👋 Привет! Я показываю лучшие посты из заданных сообществ.\n\n"
-    "📰 «Новости» — подборка: по одному лучшему посту из каждой группы.\n"
+    "📰 «Новости» — по одному лучшему посту из каждой новостной группы.\n"
+    "🎌 «Аниме» — по одному лучшему посту из каждой аниме-группы.\n"
+    "📷 «Фото» — по одному лучшему посту из каждой фотогруппы.\n\n"
+    "Во всех трёх режимах:\n"
     "    • Сначала показываю новые посты (которых раньше не было).\n"
     "    • Если новых нет — следующий по популярности из старых.\n"
     "    • Если все посты из последних 10 уже показаны — пишу «Пусто».\n\n"
-    "♻️ «Сброс» — очищаю память. После этого посты снова пойдут по кругу.\n\n"
-    "⏱ Между запросами «Новости» есть пауза — это защита от спама.\n\n"
-    "Просто нажми на кнопку ниже или напиши команду вручную."
+    "♻️ «Сброс» — очищаю память по всем трём разделам. После этого посты "
+    "снова пойдут по кругу.\n\n"
+    "⏱ Внутри одного раздела между запросами есть пауза — защита от спама. "
+    "Разные разделы друг другу не мешают: можно запросить «Новости», затем "
+    "сразу «Аниме», затем «Фото».\n\n"
+    "Кнопки «Новости», «Аниме», «Фото» работают со своими списками групп "
+    "и своей историей показов."
 )
 
 # ================== ЛОГИКА ==================
@@ -93,7 +152,10 @@ api = API(token=SERVICE_TOKEN)
 bot = Bot(token=BOT_TOKEN)
 
 
-async def get_candidate_for_group(group_id: int, peer_id: int):
+async def get_candidate_for_group(group_id: int, peer_key: str):
+    """
+    peer_key — уникальный ключ в state, например 'news:123456'.
+    """
     try:
         response = await api.wall.get(owner_id=group_id, count=POSTS_PER_GROUP)
     except Exception as e:
@@ -106,8 +168,6 @@ async def get_candidate_for_group(group_id: int, peer_id: int):
 
     current_ids = {p.id for p in posts}
     posts_by_id = {p.id: p for p in posts}
-
-    peer_key = str(peer_id)
     group_key = str(group_id)
 
     async with state_lock:
@@ -119,14 +179,8 @@ async def get_candidate_for_group(group_id: int, peer_id: int):
 
         state["known"].setdefault(peer_key, {})[group_key] = list(current_ids)
 
-        new_posts = [
-            posts_by_id[i] for i in new_ids
-            if f"{group_id}_{i}" not in seen
-        ]
-        old_posts = [
-            posts_by_id[i] for i in old_ids
-            if f"{group_id}_{i}" not in seen
-        ]
+        new_posts = [posts_by_id[i] for i in new_ids if f"{group_id}_{i}" not in seen]
+        old_posts = [posts_by_id[i] for i in old_ids if f"{group_id}_{i}" not in seen]
 
         new_posts.sort(key=lambda p: p.likes.count if p.likes else 0, reverse=True)
         old_posts.sort(key=lambda p: p.likes.count if p.likes else 0, reverse=True)
@@ -143,42 +197,42 @@ async def get_candidate_for_group(group_id: int, peer_id: int):
         return chosen, "ok"
 
 
-# ================== ОБРАБОТЧИКИ КОМАНД ==================
-
-@bot.on.message(text=["Новости", "новости", "/новости", "НОВОСТИ"])
-async def news_handler(message: Message):
+async def process_category(message: Message, category_name: str):
     peer_id = message.peer_id
+    cat = CATEGORIES[category_name]
+    peer_key = f"{category_name}:{peer_id}"
+    lock_key = (category_name, peer_id)
 
-    async with peer_locks[peer_id]:
+    async with peer_locks[lock_key]:
         now = time.monotonic()
-        last = last_request.get(peer_id, 0.0)
+        last = last_request.get(lock_key, 0.0)
         elapsed = now - last
 
         if elapsed < COOLDOWN_SECONDS:
             remaining = COOLDOWN_SECONDS - elapsed
-            print(f"[!] {peer_id}: кулдаун, осталось {remaining:.1f} сек.")
+            print(f"[!] {peer_id} / {category_name}: кулдаун, осталось {remaining:.1f} сек.")
             await message.answer(
-                f"⏳ Подожди {remaining:.0f} сек. перед следующим запросом.",
+                f"⏳ По разделу «{cat['label']}» подожди {remaining:.0f} сек.",
                 keyboard=make_keyboard(),
             )
             return
 
-        last_request[peer_id] = now
+        last_request[lock_key] = now
 
-        print(f"[→] {message.from_id} написал 'Новости' в чат {peer_id}")
-        await message.answer("Ищу новости...", keyboard=make_keyboard())
+        print(f"[→] {message.from_id}: «{cat['label']}» в чат {peer_id}")
+        await message.answer(f"Ищу «{cat['label']}»...", keyboard=make_keyboard())
 
-        for group_id in GROUP_IDS:
-            post, status = await get_candidate_for_group(group_id, peer_id)
+        for group_id in cat["group_ids"]:
+            post, status = await get_candidate_for_group(group_id, peer_key)
 
             if post:
                 attachment = f"wall{post.owner_id}_{post.id}"
                 try:
                     await message.answer(attachment=attachment)
                     likes = post.likes.count if post.likes else 0
-                    print(f"[←] {peer_id}: отправлен пост {attachment} (лайков {likes})")
+                    print(f"[←] {peer_id} / {category_name}: {attachment} (лайков {likes})")
                 except Exception as e:
-                    print(f"[ОШИБКА] Не удалось отправить {attachment}: {e}")
+                    print(f"[ОШИБКА] Отправка {attachment}: {e}")
                     await message.answer(
                         f"Не удалось отправить пост из группы {group_id}",
                         keyboard=make_keyboard(),
@@ -186,43 +240,56 @@ async def news_handler(message: Message):
             else:
                 if status == "empty":
                     await message.answer(
-                        f"Группа {group_id}: Пусто (все посты уже показаны). "
-                        f"Сбрось память кнопкой «Сброс», чтобы увидеть их снова.",
+                        f"«{cat['label']}» / группа {group_id}: Пусто "
+                        f"(все посты уже показаны). Сбрось память кнопкой «Сброс».",
                         keyboard=make_keyboard(),
                     )
                 elif status == "no_posts":
                     await message.answer(
-                        f"Группа {group_id}: Пусто (нет постов).",
+                        f"«{cat['label']}» / группа {group_id}: Пусто (нет постов).",
                         keyboard=make_keyboard(),
                     )
                 elif status == "error":
                     await message.answer(
-                        f"Группа {group_id}: Ошибка чтения.",
+                        f"«{cat['label']}» / группа {group_id}: Ошибка чтения.",
                         keyboard=make_keyboard(),
                     )
 
-        print(f"[←] Обработка запроса от {peer_id} завершена")
+        print(f"[←] {peer_id} / {category_name}: обработка завершена")
+
+
+# ================== ОБРАБОТЧИКИ ==================
+
+@bot.on.message(text=ALL_TRIGGERS)
+async def category_handler(message: Message):
+    category_name = detect_category(message.text)
+    if not category_name:
+        return
+    await process_category(message, category_name)
 
 
 @bot.on.message(text=["Сброс", "сброс", "/reset", "/сброс", "СБРОС"])
 async def reset_handler(message: Message):
     peer_id = message.peer_id
-    peer_key = str(peer_id)
 
-    async with peer_locks[peer_id]:
-        async with state_lock:
-            removed_seen = len(state["seen"].pop(peer_key, []))
-            removed_groups = len(state["known"].pop(peer_key, {}))
-            save_state()
+    async with state_lock:
+        total_seen = 0
+        total_groups = 0
+        for category_name in CATEGORIES.keys():
+            peer_key = f"{category_name}:{peer_id}"
+            total_seen += len(state["seen"].pop(peer_key, []))
+            total_groups += len(state["known"].pop(peer_key, {}))
+        save_state()
 
-        print(
-            f"[↺] {peer_id}: сброс памяти "
-            f"(удалено seen={removed_seen}, known_groups={removed_groups})"
-        )
-        await message.answer(
-            "♻️ Память сброшена. Посты снова будут показываться по кругу.",
-            keyboard=make_keyboard(),
-        )
+    print(
+        f"[↺] {peer_id}: сброс памяти по всем разделам "
+        f"(удалено seen={total_seen}, known_groups={total_groups})"
+    )
+    await message.answer(
+        "♻️ Память по всем разделам («Новости», «Аниме», «Фото») сброшена. "
+        "Посты снова будут показываться по кругу.",
+        keyboard=make_keyboard(),
+    )
 
 
 @bot.on.message(text=[
@@ -234,10 +301,9 @@ async def help_handler(message: Message):
     await message.answer(HELP_TEXT, keyboard=make_keyboard())
 
 
-# ВАЖНО: этот обработчик должен идти ПОСЛЕДНИМ
+# ВАЖНО: должен идти последним
 @bot.on.message()
 async def fallback_handler(message: Message):
-    """Срабатывает, если ни одна команда не совпала."""
     print(f"[?] {message.from_id}: неизвестная команда «{message.text}»")
     await message.answer(
         "Не знаю такую команду. Вот что я умею:\n\n" + HELP_TEXT,
@@ -248,8 +314,9 @@ async def fallback_handler(message: Message):
 if __name__ == "__main__":
     print("=" * 50)
     print("Бот запускается... (Ctrl+C для остановки)")
-    print(f"Группы для анализа: {GROUP_IDS}")
-    print(f"Кулдаун между запросами: {COOLDOWN_SECONDS:.0f} сек.")
-    print("Команды: 'Новости' — подборка, 'Сброс' — очистить историю, 'Помощь' — справка")
+    print(f"Новости: {NEWS_GROUP_IDS}")
+    print(f"Аниме:   {ANIME_GROUP_IDS}")
+    print(f"Фото:    {PHOTO_GROUP_IDS}")
+    print(f"Кулдаун внутри одного раздела: {COOLDOWN_SECONDS:.0f} сек.")
     print("=" * 50)
     bot.run_forever()
