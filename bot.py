@@ -81,13 +81,15 @@ def detect_category(text: str | None) -> str | None:
 
 
 # ================== СОСТОЯНИЕ ==================
-STATE_FILE = "state.json"
+# ================== СОСТОЯНИЕ ==================
+STATE_FILE = os.path.join("data", "state.json")   # ← изменили путь
 state_lock = asyncio.Lock()
 peer_locks = defaultdict(asyncio.Lock)
 last_request: dict[tuple[str, int], float] = {}
 
 
 def load_state() -> dict:
+    os.makedirs("data", exist_ok=True)   # ← добавили
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -101,6 +103,7 @@ def load_state() -> dict:
 
 
 def save_state() -> None:
+    os.makedirs("data", exist_ok=True)   # ← добавили
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
